@@ -14,18 +14,15 @@ class LevelProgress(BaseModel):
     answers: Dict[str, Any]  # question_id -> answer
     score: Optional[float] = None
     completed: bool = False
-    current_question: Optional[Question] = None  # for interactive/progressive levels
 
 class Resume(BaseModel):
-    name: str
-    email: str
-    phone: Optional[str] = None
     education: List[str]
     experience: List[str]
     skills: List[str]
+    # projects: Optional[List[str]] = None
     certifications: Optional[List[str]] = None
     summary: Optional[str] = None
-    # Add more fields as needed
+    
 
 class JobDescription(BaseModel):
     title: str
@@ -34,7 +31,7 @@ class JobDescription(BaseModel):
     responsibilities: List[str]
     qualifications: Optional[List[str]] = None
     description: Optional[str] = None
-    # Add more fields as needed
+    
 
 class UserState(BaseModel):
     user_id: str

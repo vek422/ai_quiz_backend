@@ -76,3 +76,7 @@ dmypy.json
 # OS files
 .DS_Store
 Thumbs.db
+
+checkpoints.sqlite3
+checkpointer.db
+test.db
