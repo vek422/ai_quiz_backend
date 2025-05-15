@@ -1,41 +1,37 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
+from langgraph.types import Command
+import json
+from app.langgraph.other.parse_resume import parse_resume
+from typing import List
+from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError
 from app.core.security import get_current_user
-from sqlalchemy.orm import Session
-from app.db.database import SessionLocal
-from app.db.models import Test, CandidateAssessment, Recruiter, Candidate, User
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.langgraph.models import userstate_initializer, JobDescription, Resume
+from app.db.models import Test, CandidateAssessment,  Candidate, User
 from pydantic import BaseModel
 from typing import Optional, List
 import uuid
 from datetime import datetime
 import csv
 from app.core.security import hash_password
-import secrets
-from app.core.email_service import send_candidate_onboarding_email
-from fastapi import BackgroundTasks
-import requests
-import tempfile
-from pdf2image import convert_from_path
-from PIL import Image
-from app.langgraph.llm_config import llm
-
+from app.core.security import generate_password
+from app.db.database import get_db
+from app.worker.queue import enqueue_resume_task
+from app.langgraph.other.parse_jd import parse_jd
+from app.langgraph.graph.main import main_graph
 router = APIRouter()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
+# Use async session for async endpoints
 # --- Recruiter Test Management ---
+
+
 class TestCreate(BaseModel):
     title: str
     jd_text: str
     scheduled_end: Optional[datetime] = None
     scheduled_start: Optional[datetime] = None
+
 
 class TestUpdate(BaseModel):
     title: Optional[str]
@@ -43,42 +39,70 @@ class TestUpdate(BaseModel):
     scheduled_end: Optional[datetime] = None
     scheduled_start: Optional[datetime] = None
 
-@router.post('/recruiter/test')
-def create_test(test: TestCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    print(current_user.role)
-    print(current_user.email)
-    if current_user.role != 'recruiter':
-        raise HTTPException(status_code=403, detail="Only recruiters can create tests")
-    recruiter_uid = current_user.uid
-    if not db.query(Recruiter).filter_by(uid=recruiter_uid).first():
-        raise HTTPException(status_code=404, detail="Recruiter not found")
-    test_id = str(uuid.uuid4())
-    now = datetime.utcnow()
-    test_obj = Test(
-        test_id=test_id,
-        recruiter_uid=recruiter_uid,
-        title=test.title,
-        jd_text=test.jd_text,
-        scheduled_end=test.scheduled_end,
-        scheduled_start=test.scheduled_start,
-        created_at=now,
-        updated_at=now
+
+class CreateTestInput(BaseModel):
+    title: str
+    jd_text: str = None
+    scheduled_start: datetime = None
+    scheduled_end: datetime = None
+
+
+@router.post("/create-test")
+async def create_test(
+    test_input: CreateTestInput,
+    session: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+
+    if not user.role == "recruiter":
+        raise HTTPException(
+            status_code=403, detail="Not authorized to create tests")
+
+    # process the jd_text
+    parsed_jd = parse_jd(test_input.jd_text)
+    print(parsed_jd)
+    if not parsed_jd:
+        raise HTTPException(
+            status_code=400, detail="JD text is not valid or empty")
+    #
+    # Step 2: Create Test entry
+    test = Test(
+        test_id=str(uuid.uuid4()),
+        recruiter_uid=user.uid,
+        title=test_input.title,
+        jd_text=parsed_jd,
+        scheduled_start=test_input.scheduled_start,
+        scheduled_end=test_input.scheduled_end,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
     )
-    db.add(test_obj)
-    db.commit()
-    return {"msg": "Test created", "test_id": test_id}
+
+    session.add(test)
+    await session.commit()
+
+    return {
+        "message": "Test created successfully",
+        "test_id": test.test_id,
+    }
+
 
 @router.get('/recruiter/tests')
-def list_recruiter_tests(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def list_recruiter_tests(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     if current_user.role != 'recruiter':
-        raise HTTPException(status_code=403, detail="Only recruiters can view tests")
-    tests = db.query(Test).filter_by(recruiter_uid=current_user.uid).all()
+        raise HTTPException(
+            status_code=403, detail="Only recruiters can view tests")
+    tests = await db.execute(select(Test).filter_by(recruiter_uid=current_user.uid))
+    tests = tests.scalars().all()
     result = []
     for t in tests:
-        total_candidates = db.query(CandidateAssessment).filter_by(test_id=t.test_id).count()
+        total_candidates = await db.execute(select(CandidateAssessment).filter_by(test_id=t.test_id))
+        total_candidates = total_candidates.scalars().all()
+        total_candidates = len(total_candidates)
         duration = None
         if t.scheduled_start and t.scheduled_end:
-            duration = (t.scheduled_end - t.scheduled_start).total_seconds() // 60  # duration in minutes
+            # duration in minutes
+            duration = (t.scheduled_end -
+                        t.scheduled_start).total_seconds() // 60
         result.append({
             "test_id": t.test_id,
             "title": t.title,
@@ -92,9 +116,39 @@ def list_recruiter_tests(current_user: User = Depends(get_current_user), db: Ses
         })
     return result
 
+
+@router.get('/candidate/tests')
+async def list_candidate_tests(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    if current_user.role != 'candidate':
+        raise HTTPException(
+            status_code=403, detail="Only candidates can view tests")
+
+    assessments = await db.execute(select(CandidateAssessment).filter_by(candidate_uid=current_user.uid))
+    assessments = assessments.scalars().all()
+    result = []
+    for assessment in assessments:
+        test = await db.execute(select(Test).filter_by(test_id=assessment.test_id))
+        test = test.scalar_one_or_none()
+        if not test:
+            continue
+
+        result.append({
+            "test_id": test.test_id,
+            "title": test.title,
+            "jd_text": test.jd_text,
+            "created_at": test.created_at,
+            "assessment_id": assessment.assessment_id,
+            "status": assessment.status,
+            "scheduled_end": test.scheduled_end,
+            "scheduled_start": test.scheduled_start,
+
+        })
+    return result
+
+
 @router.put('/recruiter/test/{test_id}')
-def update_test(test_id: str, update: TestUpdate, db: Session = Depends(get_db)):
-    test = db.query(Test).filter_by(test_id=test_id).first()
+async def update_test(test_id: str, update: TestUpdate, db: AsyncSession = Depends(get_db)):
+    test = await db.execute(db.query(Test).filter_by(test_id=test_id)).first()
     if not test:
         raise HTTPException(status_code=404, detail="Test not found")
     if update.title:
@@ -106,160 +160,245 @@ def update_test(test_id: str, update: TestUpdate, db: Session = Depends(get_db))
     if update.scheduled_start is not None:
         test.scheduled_start = update.scheduled_start
     test.updated_at = datetime.utcnow()
-    db.commit()
+    await db.commit()
     return {"msg": "Test updated"}
 
+
 @router.delete('/recruiter/test/{test_id}')
-def delete_test(test_id: str, db: Session = Depends(get_db)):
-    test = db.query(Test).filter_by(test_id=test_id).first()
+async def delete_test(test_id: str, db: AsyncSession = Depends(get_db)):
+    test = await db.execute(db.query(Test).filter_by(test_id=test_id)).first()
     if not test:
         raise HTTPException(status_code=404, detail="Test not found")
-    db.delete(test)
-    db.commit()
+    await db.delete(test)
+    await db.commit()
     return {"msg": "Test deleted"}
 
-from typing import List
-from pydantic import BaseModel
 
 class CandidateInput(BaseModel):
-    name: str
     email: str
-    phone: str
     resume_link: str
 
-@router.post('/recruiter/test/{test_id}/add_candidates')
-def add_candidates_json(test_id: str, candidates: List[CandidateInput], db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    test = db.query(Test).filter_by(test_id=test_id).first()
+
+@router.post('/{test_id}/add-candidates')
+async def add_candidates(
+    test_id: str,
+    candidates: List[CandidateInput],
+    session: AsyncSession = Depends(get_db),
+):
+    # Step 1: Check if Test exists
+    test = await session.execute(select(Test).where(Test.test_id == test_id))
+    test = test.scalar_one_or_none()
     if not test:
         raise HTTPException(status_code=404, detail="Test not found")
-    if current_user.role != 'recruiter' or test.recruiter_uid != current_user.uid:
-        raise HTTPException(status_code=403, detail="Not authorized to add candidates for this test")
-    results = []
-    for candidate_input in candidates:
-        name = candidate_input.name
-        email = candidate_input.email
-        phone = candidate_input.phone
-        resume_link = candidate_input.resume_link
-        user = db.query(User).filter_by(email=email).first()
-        password = None
-        created = False
-        if not user:
-            uid = str(uuid.uuid4())
-            password = secrets.token_urlsafe(8)
-            test_link = 'test link'
-            try:
-                send_candidate_onboarding_email(name, email, password, test.title, resume_link, test_link)
-            except Exception as e:
-                results.append({"name": name, "email": email, "created": False, "password": password, "error": str(e)})
-                continue  # Skip DB commit for this candidate
-            user = User(uid=uid, email=email, password_hash=hash_password(password), role='candidate')
-            candidate = Candidate(uid=uid, name=name, phone=phone, resume_link=resume_link)
-            db.add(user)
-            db.add(candidate)
-            created = True
+    created_or_updated_candidates = []
+
+    for candidate_data in candidates:
+        # Step 1: Check if User already exists
+        query = await session.execute(select(User).where(User.email == candidate_data.email))
+        existing_user = query.scalar_one_or_none()
+
+        if existing_user:
+            candidate_uid = existing_user.uid
+
+            query_candidate = await session.execute(select(Candidate).where(Candidate.uid == candidate_uid))
+            candidate_profile = query_candidate.scalar_one_or_none()
+
+            if not candidate_profile:
+                raise HTTPException(
+                    status_code=400, detail=f"Candidate profile missing for {candidate_data.email}")
+
+            # Use the async function version
+            await enqueue_resume_task(candidate_uid=candidate_uid, resume_link=candidate_data.resume_link)
+
+            candidate_info = {
+                "email": candidate_data.email,
+                "candidate_uid": candidate_uid,
+                "is_new_user": False
+            }
+
         else:
-            candidate = db.query(Candidate).filter_by(uid=user.uid).first()
-            if candidate:
-                candidate.resume_link = resume_link
-                candidate.phone = phone
-            else:
-                candidate = Candidate(uid=user.uid, name=name, phone=phone, resume_link=resume_link)
-                db.add(candidate)
-        assessment = db.query(CandidateAssessment).filter_by(candidate_uid=candidate.uid, test_id=test_id).first()
-        if not assessment:
-            assessment_id = str(uuid.uuid4())
-            assessment = CandidateAssessment(assessment_id=assessment_id, candidate_uid=candidate.uid, test_id=test_id)
-            db.add(assessment)
-        results.append({
-            "name": name,
-            "email": email,
-            "created": created,
-            "password": password,
-            "resume_link": resume_link
-        })
-    db.commit()
-    return {"candidates": results}
+            # New candidate
+            random_password = generate_password()
+            user = User(
+                uid=str(uuid.uuid4()),
+                email=candidate_data.email,
+                password_hash=hash_password(random_password),
+                role="candidate",
+                name=candidate_data.email.split(
+                    '@')[0],  # Default name from email
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            session.add(user)
+            await session.flush()
 
-# --- Candidate Assessment Management ---
-@router.get('/candidate/tests')
-def list_available_tests(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    now = datetime.utcnow()
-    # Fetch tests for which the current user (candidate) has an assessment
-    assessments = db.query(CandidateAssessment).filter_by(candidate_uid=current_user.uid).all()
-    test_ids = [a.test_id for a in assessments]
-    tests = db.query(Test).filter(Test.test_id.in_(test_ids)).all()
-    return [{
-        "test_id": t.test_id,
-        "title": t.title,
-        "jd_text": t.jd_text,
-        "created_at": t.created_at,
-        "updated_at": t.updated_at,
-        "scheduled_end": t.scheduled_end,
-        "scheduled_start": t.scheduled_start
-    } for t in tests]
+            candidate = Candidate(
+                uid=user.uid,
+                resume_text="Waiting for resume parsing",
+                created_at=datetime.utcnow()
+            )
+            session.add(candidate)
 
-def extract_text_from_pdf(pdf_url: str) -> str:
-    # Download PDF
-    response = requests.get(pdf_url)
-    response.raise_for_status()
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_pdf:
-        tmp_pdf.write(response.content)
-        tmp_pdf.flush()
-        # Convert PDF to images
-        images = convert_from_path(tmp_pdf.name)
-    # OCR each image using LLM (simulate with LLM prompt)
-    all_text = []
-    for img in images:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_img:
-            img.save(tmp_img.name)
-            # You could use an OCR library, but as per prompt, use LLM
-            prompt = f"Extract all relevant resume details from this image. Return as plain text. (Assume image is base64-encoded)"
-            with open(tmp_img.name, "rb") as f:
-                img_bytes = f.read()
-            # In practice, you would encode to base64 and send to LLM if it supports vision
-            # Here, just simulate with a placeholder
-            text = llm.invoke(prompt)  # Replace with actual vision LLM call if available
-            all_text.append(text.content if hasattr(text, 'content') else str(text))
-    return "\n".join(all_text)
+            # Use the async function version
+            await enqueue_resume_task(candidate_uid=user.uid, resume_link=candidate_data.resume_link)
 
-def extract_jd_fields(jd_text: str) -> dict:
-    prompt = f"""
-    Extract the following fields from this job description text:\n\n{jd_text}\n\nFields: position, required_skills (list), experience_level. Return as JSON."
-    """
-    result = llm.invoke(prompt)
-    import json
-    try:
-        return json.loads(result.content)
-    except Exception:
-        return {}
+            candidate_uid = user.uid
 
-@router.post('/candidate/assessment/start')
-def start_assessment(candidate_uid: str, test_id: str, db: Session = Depends(get_db), background_tasks: BackgroundTasks = None):
-    # Fetch candidate and test
-    candidate = db.query(Candidate).filter_by(uid=candidate_uid).first()
-    test = db.query(Test).filter_by(test_id=test_id).first()
-    if not candidate or not test:
-        raise HTTPException(status_code=404, detail="Candidate or Test not found")
-    # Download and parse resume
-    resume_text = extract_text_from_pdf(candidate.resume_link)
-    # Parse JD fields
-    jd_fields = extract_jd_fields(test.jd_text)
-    # Build initial state
-    from app.langgraph.state import UserState
-    initial_state = UserState(
-        assessment_id=str(uuid.uuid4()),
-        user_id=candidate_uid,
-        current_level=1,
-        progress={},
-        resume_text=resume_text,
-        jd_fields=jd_fields
+            candidate_info = {
+                "email": candidate_data.email,
+                "candidate_uid": candidate_uid,
+                "is_new_user": True,
+                "password": random_password  # Include password for new users for testing purposes
+            }
+
+        # Step 2: Create CandidateAssessment entry
+        assessment = CandidateAssessment(
+            assessment_id=str(uuid.uuid4()),
+            candidate_uid=candidate_uid,
+            test_id=test_id,
+            started_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+            status="not_started"
+        )
+        session.add(assessment)
+
+        candidate_info["assessment_id"] = assessment.assessment_id
+        created_or_updated_candidates.append(candidate_info)
+
+    await session.commit()
+
+    return {
+        "message": f"{len(created_or_updated_candidates)} candidates processed",
+        "candidates": created_or_updated_candidates
+    }
+
+
+# candidate
+
+
+@router.post('/candidate/test/{test_id}/start')
+async def start_test(test_id: str, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+
+    test = await db.execute(
+        select(Test).where(Test.test_id == test_id)
     )
-    # Save state in checkpointer (memory)
-    from app.langgraph.graph import main_workflow
-    main_workflow.checkpointer.put(initial_state.assessment_id, initial_state)
-    return {"assessment_id": initial_state.assessment_id, "current_level": 1, "resume_text": resume_text, "jd_fields": jd_fields}
+    test = test.scalar_one_or_none()
+    if not test:
+        raise HTTPException(status_code=404, detail="Test not found")
 
-@router.get('/candidate/assessments')
-def list_candidate_assessments(candidate_uid: str, db: Session = Depends(get_db)):
-    assessments = db.query(CandidateAssessment).filter_by(candidate_uid=candidate_uid).all()
-    return [{"assessment_id": a.assessment_id, "test_id": a.test_id, "started_at": a.started_at, "updated_at": a.updated_at} for a in assessments]
+    # Check if the candidate has an assessment for this test
+    assessment = await db.execute(
+        select(CandidateAssessment).where(
+            CandidateAssessment.test_id == test_id,
+            CandidateAssessment.candidate_uid == current_user.uid
+        )
+    )
+    assessment = assessment.scalar_one_or_none()
+    # Check if the assessment is already in progress or completed
+    if not assessment:
+        raise HTTPException(
+            status_code=404, detail="Candidate assessment not found")
+
+    # check if the assessment started or not
+    # if assessment.status == "in_progress":
+    #     raise HTTPException(
+    #         status_code=400, detail="Assessment already in progress")
+    # if assessment.status == "completed":
+    #     raise HTTPException(
+    #         status_code=400, detail="Assessment already completed")
+
+    candidate = await db.execute(select(Candidate).where(
+        Candidate.uid == current_user.uid
+    ))
+    candidate = candidate.scalar_one_or_none()
+    if not candidate:
+        raise HTTPException(
+            status_code=404, detail="Candidate profile not found")
+    candidate_resume = candidate.resume_text
+    parsed_jd = json.loads(test.jd_text)
+    parsed_resume = json.loads(candidate_resume)
+
+    config = {
+        "thread_id": assessment.assessment_id,
+    }
+    userState = userstate_initializer()
+    userState.user_id = current_user.uid
+    userState.job_description = JobDescription(
+        required_skills=parsed_jd.get("required_skills"),
+        title=parsed_jd.get("title"),
+        company=parsed_jd.get("company"),
+        responsibilities=parsed_jd.get("responsibilities"),
+        qualifications=parsed_jd.get("qualifications"),
+        description=parsed_jd.get("description")
+    )
+    userState.resume = Resume(
+        skills=parsed_resume.get("skills"),
+        education=parsed_resume.get("education"),
+        experience=parsed_resume.get("experience"),
+        projects=parsed_resume.get("projects"),
+        certifications=parsed_resume.get("certifications"),
+        summary=parsed_resume.get("summary")
+    )
+
+    # get the questio
+    # n for the test from langraph
+    questions = main_graph.invoke(
+        userState,
+        config=config,
+    )
+
+    # Start the test
+    # update the status of the assessment
+    assessment.status = "in_progress"
+    assessment.started_at = datetime.utcnow()
+    await db.commit()
+    return {"message": "Test started", "test_id": test_id, "questions": questions}
+
+
+@router.post("/candidate/test/{test_id}/level/{level}/submit")
+async def submit_level1_test(
+    test_id: str,
+    level: int,
+    answers: List[dict[str, str]],
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # Check if the candidate has an assessment for this test
+    assessment = await db.execute(
+        select(CandidateAssessment).where(
+            CandidateAssessment.test_id == test_id,
+            CandidateAssessment.candidate_uid == current_user.uid
+        )
+    )
+    assessment = assessment.scalar_one_or_none()
+    if not assessment:
+        raise HTTPException(
+            status_code=404, detail="Candidate assessment not found")
+
+    # Check if the assessment is already completed
+    if assessment.status == "completed":
+        raise HTTPException(
+            status_code=400, detail="Assessment already completed")
+
+    # get the state from the checkpointer
+    config = {
+        "thread_id": assessment.assessment_id,
+    }
+    state = main_graph.get_state(config=config)
+    if not state:
+        raise HTTPException(
+            status_code=404, detail="State not found for this assessment")
+
+    #  check the current stage
+    current_level = state.values.get("current_level")
+    if (current_level != level):
+        raise HTTPException(
+            status_code=400, detail=f"Current level is {current_level}, not {level}")
+
+    # invoke the graph with updated answers
+    result = main_graph.invoke(
+        Command(resume=answers, config=config)
+    )
+    print(result)
+    return {"message": "Level 1 test submitted", "result": result}
+    # Update the answers in the database

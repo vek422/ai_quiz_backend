@@ -1,0 +1,1758 @@
+================================================================================
+filepath: app\main.py
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.db.database import Base,engine
+from app.api.routes import auth
+
+from app.api.routes import test_assessment
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.include_router(auth.router,prefix='/auth',tags=["Auth"])
+app.include_router(test_assessment.router,prefix='/test',tags=["Test"])
+================================================================================
+filepath: app\api\routes\auth.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from app.db.database import SessionLocal
+from app.db.models import User, Candidate, Recruiter
+from app.core.security import hash_password, verify_password, create_access_token
+from pydantic import BaseModel
+import uuid
+
+router = APIRouter()
+
+class CandidateRegister(BaseModel):
+    name: str
+    email: str
+    password: str
+    phone: str
+    resume_link: str 
+
+class RecruiterRegister(BaseModel):
+    name: str
+    email: str
+    password: str
+    company: str
+    phone: str
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@router.post('/candidate/signup')
+def candidate_signup(user: CandidateRegister, db: Session = Depends(get_db)):
+    if db.query(User).filter_by(email=user.email).first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+    uid = str(uuid.uuid4())
+    user_obj = User(uid=uid, email=user.email, password_hash=hash_password(user.password), role='candidate')
+    candidate = Candidate(uid=uid, name=user.name, phone=user.phone,resume_link=user.resume_link)
+    db.add(user_obj)
+    db.add(candidate)
+    db.commit()
+    return {"msg": "Candidate created successfully", "uid": uid}
+
+@router.post('/recruiter/signup')
+def recruiter_signup(user: RecruiterRegister, db: Session = Depends(get_db)):
+    if db.query(User).filter_by(email=user.email).first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+    uid = str(uuid.uuid4())
+    user_obj = User(uid=uid, email=user.email, password_hash=hash_password(user.password), role='recruiter')
+    recruiter = Recruiter(uid=uid, name=user.name, company=user.company, phone=user.phone)
+    db.add(user_obj)
+    db.add(recruiter)
+    db.commit()
+    return {"msg": "Recruiter created successfully", "uid": uid}
+
+@router.post('/login')
+def login(user: UserLogin, db: Session = Depends(get_db)):
+    user_row = db.query(User).filter_by(email=user.email).first()
+    if not user_row or not verify_password(user.password, user_row.password_hash):
+        raise HTTPException(status_code=400, detail="Invalid credentials")
+    token = create_access_token(data={"sub": user_row.uid, "role": user_row.role})
+    return {
+        "token": token, 
+        "token_type": "bearer", 
+        "user": {
+            "uid": user_row.uid, 
+            "role": user_row.role, 
+            "email": user_row.email,
+            "name": user_row.candidate.name if user_row.role == 'candidate' else user_row.recruiter.name,
+            "company": user_row.recruiter.company if user_row.role == 'recruiter' else None,
+        }
+    }
+
+# CRUD endpoints for candidate and recruiter profiles
+from fastapi import status
+from typing import Optional
+
+class CandidateProfileUpdate(BaseModel):
+    name: Optional[str]
+    phone: Optional[str]
+
+class RecruiterProfileUpdate(BaseModel):
+    name: Optional[str]
+    company: Optional[str]
+    phone: Optional[str]
+
+@router.get('/candidate/profile')
+def get_candidate_profile(uid: str, db: Session = Depends(get_db)):
+    candidate = db.query(Candidate).filter_by(uid=uid).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    return {"uid": candidate.uid, "name": candidate.name, "phone": candidate.phone}
+
+@router.put('/candidate/profile')
+def update_candidate_profile(uid: str, update: CandidateProfileUpdate, db: Session = Depends(get_db)):
+    candidate = db.query(Candidate).filter_by(uid=uid).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    if update.name:
+        candidate.name = update.name
+    if update.phone:
+        candidate.phone = update.phone
+    db.commit()
+    return {"msg": "Candidate profile updated"}
+
+
+@router.get('/recruiter/profile')
+def get_recruiter_profile(uid: str, db: Session = Depends(get_db)):
+    recruiter = db.query(Recruiter).filter_by(uid=uid).first()
+    if not recruiter:
+        raise HTTPException(status_code=404, detail="Recruiter not found")
+    return {"uid": recruiter.uid, "name": recruiter.name, "company": recruiter.company, "phone": recruiter.phone}
+
+@router.put('/recruiter/profile')
+def update_recruiter_profile(uid: str, update: RecruiterProfileUpdate, db: Session = Depends(get_db)):
+    recruiter = db.query(Recruiter).filter_by(uid=uid).first()
+    if not recruiter:
+        raise HTTPException(status_code=404, detail="Recruiter not found")
+    if update.name:
+        recruiter.name = update.name
+    if update.company:
+        recruiter.company = update.company
+    if update.phone:
+        recruiter.phone = update.phone
+    db.commit()
+    return {"msg": "Recruiter profile updated"}
+
+@router.delete('/recruiter/profile')
+def delete_recruiter_profile(uid: str, db: Session = Depends(get_db)):
+    recruiter = db.query(Recruiter).filter_by(uid=uid).first()
+    user = db.query(User).filter_by(uid=uid).first()
+    if not recruiter or not user:
+        raise HTTPException(status_code=404, detail="Recruiter not found")
+    db.delete(recruiter)
+    db.delete(user)
+    db.commit()
+    return {"msg": "Recruiter deleted"}
+
+
+
+
+================================================================================
+filepath: app\api\routes\test_assessment.py
+import json
+from app.langgraph.other.parse_resume import parse_resume
+from typing import List
+from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError
+from app.core.security import get_current_user
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import sessionmaker
+from app.db.database import engine
+from app.db.models import Test, CandidateAssessment, Recruiter, Candidate, User
+from pydantic import BaseModel
+from typing import Optional, List
+import uuid
+from datetime import datetime
+import csv
+from app.core.security import hash_password
+from app.core.security import generate_password
+from app.db.database import get_db
+from app.worker.queue import enqueue_resume_task
+from app.langgraph.other.parse_jd import parse_jd
+from app.langgraph.graph.main import main_graph
+router = APIRouter()
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+# Use async session for async endpoints
+
+
+# --- Recruiter Test Management ---
+
+
+class TestCreate(BaseModel):
+    title: str
+    jd_text: str
+    scheduled_end: Optional[datetime] = None
+    scheduled_start: Optional[datetime] = None
+
+
+class TestUpdate(BaseModel):
+    title: Optional[str]
+    jd_text: Optional[str]
+    scheduled_end: Optional[datetime] = None
+    scheduled_start: Optional[datetime] = None
+
+
+class CreateTestInput(BaseModel):
+    title: str
+    jd_text: str = None
+    scheduled_start: datetime = None
+    scheduled_end: datetime = None
+
+
+@router.post("/recruiter/create-test")
+async def create_test(
+    test_input: CreateTestInput,
+    session: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if not user.role != "recruiter":
+        raise HTTPException(
+            status_code=403, detail="Not authorized to create tests")
+
+    # process the jd_text
+    parsed_jd = parse_jd(test_input.jd_text)
+    if not parsed_jd:
+        raise HTTPException(
+            status_code=400, detail="JD text is not valid or empty")
+    #
+    # Step 2: Create Test entry
+    test = Test(
+        test_id=str(uuid.uuid4()),
+        recruiter_uid=user.uid,
+        title=test_input.title,
+        jd_text=parsed_jd,
+        scheduled_start=test_input.scheduled_start,
+        scheduled_end=test_input.scheduled_end,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+
+    session.add(test)
+    await session.commit()
+
+    return {
+        "message": "Test created successfully",
+        "test_id": test.test_id,
+    }
+
+
+@router.get('/recruiter/tests')
+async def list_recruiter_tests(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db())):
+    if current_user.role != 'recruiter':
+        raise HTTPException(
+            status_code=403, detail="Only recruiters can view tests")
+    tests = await db.execute(db.query(Test).filter_by(recruiter_uid=current_user.uid)).all()
+    result = []
+    for t in tests:
+        total_candidates = await db.execute(db.query(CandidateAssessment).filter_by(test_id=t.test_id)).count()
+        duration = None
+        if t.scheduled_start and t.scheduled_end:
+            # duration in minutes
+            duration = (t.scheduled_end -
+                        t.scheduled_start).total_seconds() // 60
+        result.append({
+            "test_id": t.test_id,
+            "title": t.title,
+            "jd_text": t.jd_text,
+            "created_at": t.created_at,
+            "updated_at": t.updated_at,
+            "scheduled_end": t.scheduled_end,
+            "scheduled_start": t.scheduled_start,
+            "total_candidates": total_candidates,
+            "duration_minutes": duration
+        })
+    return result
+
+
+@router.put('/recruiter/test/{test_id}')
+async def update_test(test_id: str, update: TestUpdate, db: AsyncSession = Depends(get_db())):
+    test = await db.execute(db.query(Test).filter_by(test_id=test_id)).first()
+    if not test:
+        raise HTTPException(status_code=404, detail="Test not found")
+    if update.title:
+        test.title = update.title
+    if update.jd_text:
+        test.jd_text = update.jd_text
+    if update.scheduled_end is not None:
+        test.scheduled_end = update.scheduled_end
+    if update.scheduled_start is not None:
+        test.scheduled_start = update.scheduled_start
+    test.updated_at = datetime.utcnow()
+    await db.commit()
+    return {"msg": "Test updated"}
+
+
+@router.delete('/recruiter/test/{test_id}')
+async def delete_test(test_id: str, db: AsyncSession = Depends(get_db())):
+    test = await db.execute(db.query(Test).filter_by(test_id=test_id)).first()
+    if not test:
+        raise HTTPException(status_code=404, detail="Test not found")
+    await db.delete(test)
+    await db.commit()
+    return {"msg": "Test deleted"}
+
+
+class CandidateInput(BaseModel):
+    name: str
+    email: str
+    phone: str
+    resume_link: str
+
+
+class CandidateInput(BaseModel):
+    email: str
+    resume_link: str
+
+
+@router.post("/recruiter/add-candidates")
+async def add_candidates(
+    candidates: List[CandidateInput],
+    session: AsyncSession = Depends(get_db),
+):
+    created_or_updated_candidates = []
+
+    for candidate_data in candidates:
+        # Step 1: Check if User already exists
+        query = await session.execute(select(User).where(User.email == candidate_data.email))
+        existing_user = query.scalar_one_or_none()
+
+        if existing_user:
+            candidate_uid = existing_user.uid
+
+            query_candidate = await session.execute(select(Candidate).where(Candidate.id == candidate_uid))
+            candidate_profile = query_candidate.scalar_one_or_none()
+
+            if not candidate_profile:
+                raise HTTPException(
+                    status_code=400, detail=f"Candidate profile missing for {candidate_data.email}")
+
+            await enqueue_resume_task(candidate_uid=candidate_uid, resume_link=candidate_data.resume_link)
+
+        else:
+            # New candidate
+            random_password = generate_password()
+            user = User(
+                uid=str(uuid.uuid4()),
+                email=candidate_data.email,
+                password_hash=hash_password(random_password),
+                role="candidate",
+            )
+            session.add(user)
+            await session.flush()
+
+            candidate = Candidate(
+                id=user.uid,
+                email=candidate_data.email,
+                password_hash=user.password_hash,
+                created_at=datetime.utcnow(),
+            )
+            session.add(candidate)
+
+            await enqueue_resume_task(candidate_uid=user.uid, resume_link=candidate_data.resume_link)
+
+            candidate_uid = user.uid
+
+        # Step 2: Create CandidateAssessment entry
+        assessment = CandidateAssessment(
+            assessment_id=str(uuid.uuid4()),
+            candidate_uid=candidate_uid,
+            test_id=candidate_data.test_id,
+            started_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+        session.add(assessment)
+
+        created_or_updated_candidates.append({
+            "email": candidate_data.email,
+            "candidate_uid": candidate_uid,
+            "assessment_id": assessment.assessment_id
+        })
+
+    await session.commit()
+
+    return {
+        "message": f"{len(created_or_updated_candidates)} candidates processed",
+        "candidates": created_or_updated_candidates
+    }
+
+
+@router.get('/candidate/tests')
+async def list_available_tests(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db())):
+    now = datetime.utcnow()
+    # Fetch tests for which the current user (candidate) has an assessment
+    assessments = await db.execute(db.query(CandidateAssessment).filter_by(candidate_uid=current_user.uid)).all()
+    test_ids = [a.test_id for a in assessments]
+    tests = await db.execute(db.query(Test).filter(Test.test_id.in_(test_ids))).all()
+    return [{
+        "test_id": t.test_id,
+        "title": t.title,
+        "jd_text": t.jd_text,
+        "created_at": t.created_at,
+        "updated_at": t.updated_at,
+        "scheduled_end": t.scheduled_end,
+        "scheduled_start": t.scheduled_start
+    } for t in tests]
+
+
+# candidate
+@router.post('/candidate/test/{test_id}/start')
+async def start_test(test_id: str, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db())):
+
+    test = await db.execute(
+        select(Test).where(Test.test_id == test_id)
+    )
+    test = test.scalar_one_or_none()
+    if not test:
+        raise HTTPException(status_code=404, detail="Test not found")
+
+    # Check if the candidate has an assessment for this test
+    assessment = await db.execute(
+        select(CandidateAssessment).where(
+            CandidateAssessment.test_id == test_id,
+            CandidateAssessment.candidate_uid == current_user.uid
+        )
+    )
+    assessment = assessment.scalar_one_or_none()
+    # Check if the assessment is already in progress or completed
+    if not assessment:
+        raise HTTPException(
+            status_code=404, detail="Candidate assessment not found")
+    # Start the test
+    # update the status of the assessment
+    assessment.status = "in_progress"
+    assessment.started_at = datetime.utcnow()
+    await db.commit()
+
+    parsed_jd = json.loads(test.jd_text)
+    parsed_resume = parse_resume(current_user.resume_text)
+    parsed_resume = json.loads(parsed_resume)
+
+    config = {
+        "thread_id": assessment.assessment_id,
+    }
+    # get the question for the test from langraph
+    questions = main_graph.invoke(
+        context={"parsed_jd": parsed_jd,
+                 "parsed_resume": parsed_resume,
+                 "test_id": test_id
+                 },
+        config=config,
+    )
+
+    return {"message": "Test started", "test_id": test_id, "questions": questions}
+
+================================================================================
+filepath: app\core\config.py
+from langchain_openai import ChatOpenAI
+import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+from dotenv import load_dotenv
+import os
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL")
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=OPENAI_API_KEY)
+conn = sqlite3.connect('checkpoints.sqlite3', check_same_thread=False)
+memory = SqliteSaver(conn)
+
+================================================================================
+filepath: app\core\email_service.py
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
+from fastapi import HTTPException
+from .config import SENDGRID_API_KEY,SENDGRID_FROM_EMAIL
+def send_email(to_email: str, subject: str, content: str):
+    api_key = SENDGRID_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=500, detail="SendGrid API key not configured")
+    message = Mail(
+        from_email=SENDGRID_FROM_EMAIL,
+        to_emails=to_email,
+        subject=subject,
+        html_content=content
+    )
+    try:
+        sg = SendGridAPIClient(api_key)
+        response = sg.send(message)
+        return response.status_code
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
+
+def send_candidate_onboarding_email(name: str, email: str, password: str, test_title: str, resume_link: str, test_link: str):
+    subject = f"Your Assessment Invitation for {test_title}"
+    content = f"""
+    <p>Dear {name},</p>
+    <p>You have been invited to take the assessment: <b>{test_title}</b>.</p>
+    <p>Your login credentials are:</p>
+    <ul>
+        <li>Email: {email}</li>
+        <li>Password: {password}</li>
+    </ul>
+    <p>Resume Link: <a href='{resume_link}'>{resume_link}</a></p>
+    <p>Test Link: <a href='{test_link}'>{test_link}</a></p>
+    <p>Best of luck!</p>
+    """
+    return send_email(email, subject, content)
+
+================================================================================
+filepath: app\core\security.py
+from passlib.context import CryptContext
+from jose import jwt
+from datetime import timedelta, datetime, timezone
+import uuid
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.orm import Session
+from app.db.database import SessionLocal
+from app.db.models import User
+from jose import JWTError
+import secrets
+import string
+
+SECRET_KEY = "secret"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+
+def verify_password(plain, hashed):
+    return pwd_context.verify(plain, hashed)
+
+
+def create_access_token(data: dict, expires_delta: timedelta = timedelta(hours=1)):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + expires_delta
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_token(token: str):
+    return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+
+
+def generate_password(length: int = 12) -> str:
+    """
+    Generate a secure random password with the given length.
+    The password will contain uppercase, lowercase, digits, and punctuation.
+    """
+    alphabet = string.ascii_letters + string.digits + string.punctuation
+    while True:
+        password = ''.join(secrets.choice(alphabet) for _ in range(length))
+        # Ensure the password has at least one character from each category
+        if (any(c.islower() for c in password)
+            and any(c.isupper() for c in password)
+            and any(c.isdigit() for c in password)
+                and any(c in string.punctuation for c in password)):
+            return password
+
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    try:
+        payload = decode_token(token)
+        uid = payload.get("sub")
+        role = payload.get("role")
+        if not uid or not role:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        user = db.query(User).filter_by(uid=uid).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        return user
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+================================================================================
+filepath: app\db\database.py
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+DATABASE_URL = "sqlite+aiosqlite:///./test.db"  # Use async SQLite driver
+
+engine = create_async_engine(
+    DATABASE_URL,
+    connect_args={
+        "check_same_thread": False
+    }
+)
+AsyncSessionLocal = sessionmaker(
+    bind=engine, class_=AsyncSession, expire_on_commit=False, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+================================================================================
+filepath: app\db\models.py
+from sqlalchemy import Column, String, ForeignKey, DateTime, Integer, ARRAY, func
+from sqlalchemy.orm import relationship
+from datetime import datetime
+from app.db.database import Base
+
+
+class User(Base):
+    __tablename__ = 'user'
+    uid = Column(String, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    role = Column(String, nullable=False)  # 'candidate' or 'recruiter'
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow,
+                        onupdate=datetime.utcnow)
+
+    candidate = relationship('Candidate', back_populates='user', uselist=False)
+    recruiter = relationship('Recruiter', back_populates='user', uselist=False)
+
+
+class Candidate(Base):
+    __tablename__ = 'candidate'
+    id = Column(String, ForeignKey('user.uid'), primary_key=True)
+    resume_text = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship('User', back_populates='candidate')
+    assessments = relationship(
+        'CandidateAssessment', back_populates='candidate')
+
+
+class Recruiter(Base):
+    __tablename__ = 'recruiter'
+    uid = Column(String, ForeignKey('user.uid'), primary_key=True)
+    name = Column(String)
+    company = Column(String)
+    phone = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow,
+                        onupdate=datetime.utcnow)
+
+    user = relationship('User', back_populates='recruiter')
+    tests = relationship('Test', back_populates='recruiter')
+
+
+class Test(Base):
+    __tablename__ = 'test'
+    test_id = Column(String, primary_key=True, index=True)
+    recruiter_uid = Column(String, ForeignKey('recruiter.uid'))
+    title = Column(String)
+    jd_text = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow,
+                        onupdate=datetime.utcnow)
+    scheduled_start = Column(DateTime, nullable=True)
+    scheduled_end = Column(DateTime, nullable=True)
+
+    job_description = relationship('JobDescription')
+    recruiter = relationship('Recruiter', back_populates='tests')
+    assessments = relationship('CandidateAssessment', back_populates='test')
+
+
+class CandidateAssessment(Base):
+    __tablename__ = 'candidate_assessment'
+    assessment_id = Column(String, primary_key=True, index=True)
+    candidate_uid = Column(String, ForeignKey('candidate.id'))
+    test_id = Column(String, ForeignKey('test.test_id'))
+    started_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow,
+                        onupdate=datetime.utcnow)
+    status = Column(String, default="not_started")
+    score = Column(Integer, nullable=True)
+
+    candidate = relationship('Candidate', back_populates='assessments')
+    test = relationship('Test', back_populates='assessments')
+
+
+class JobDescription(Base):
+    __tablename__ = 'job_descriptions'
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False)
+    company = Column(String, nullable=False)
+    # Use ARRAY if Postgres; otherwise replace with JSON
+    required_skills = Column(ARRAY(String))
+    responsibilities = Column(ARRAY(String))
+    qualifications = Column(ARRAY(String))
+    description = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+================================================================================
+filepath: app\langgraph\graph.py
+
+================================================================================
+filepath: app\langgraph\models.py
+from typing import List, Dict, Optional, Any
+from pydantic import BaseModel
+from typing_extensions import Annotated
+import operator
+
+
+class Question(BaseModel):
+    id: str
+    text: str
+    options: List[str]
+    level: int
+    metadata: Optional[dict] = None
+
+
+class LevelProgress(BaseModel):
+    level: int
+    questions: Annotated[List[Question], operator.add]
+    answers: Dict[str, Any]  # question_id -> answer
+    score: Optional[float] = None
+    completed: bool = False
+
+
+class Resume(BaseModel):
+    education: List[str]
+    experience: List[str]
+    skills: List[str]
+    projects: Optional[List[str]] = None
+    certifications: Optional[List[str]] = None
+    summary: Optional[str] = None
+
+
+def merge_progress_dicts(a: Dict[int, LevelProgress], b: Dict[int, LevelProgress]) -> Dict[int, LevelProgress]:
+    result = a.copy()
+    for level, progress_b in b.items():
+        if level in result:
+            progress_a = result[level]
+            # Merge questions and answers
+            progress_a.questions += progress_b.questions
+            progress_a.answers.update(progress_b.answers)
+            # Handle score and completed carefully (could customize this)
+            if progress_b.score is not None:
+                progress_a.score = progress_b.score
+            if progress_b.completed:
+                progress_a.completed = True
+        else:
+            result[level] = progress_b
+    return result
+
+
+class JobDescription(BaseModel):
+    title: str
+    company: str
+    required_skills: List[str]
+    responsibilities: List[str]
+    qualifications: Optional[List[str]] = None
+    description: Optional[str] = None
+
+
+class UserState(BaseModel):
+    user_id: str
+    job_description: JobDescription
+    resume: Resume
+    current_level: int
+    unlocked_levels: List[int]
+    progress: Annotated[Dict[int, LevelProgress],
+                        merge_progress_dicts]  # level -> LevelProgress
+
+
+class GenerateResponse(BaseModel):
+    questions: List[Question]
+
+
+class SubmitRequest(BaseModel):
+    answers: Dict[str, Any]  # question_id -> answer
+
+
+class SubmitResponse(BaseModel):
+    evaluation: Dict[str, Any]
+    next_instructions: Optional[str] = None
+
+
+class StateResponse(BaseModel):
+    current_level: int
+    unlocked_levels: List[int]
+    progress: Dict[int, LevelProgress]
+
+
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+def userstate_initializer(data: Optional[dict] = None) -> UserState:
+    """Initialize UserState if none provided."""
+    if data is None:
+        # Create a default UserState
+        return UserState(
+            user_id="",
+            job_description=JobDescription(
+                title="",
+                company="",
+                required_skills=[],
+                responsibilities=[],
+                qualifications=[],
+                description=""
+            ),
+            resume=Resume(
+                education=[],
+                experience=[],
+                skills=[],
+                projects=[],
+                certifications=[],
+                summary=""
+            ),
+            current_level=1,
+            unlocked_levels=[1],
+            progress={}
+        )
+    return UserState(**data)
+
+================================================================================
+filepath: app\langgraph\prompts.py
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.prompts import ChatPromptTemplate
+
+resume_parsing_prompt = ChatPromptTemplate.from_template("""
+You are an expert resume extractor. Your task is to extract structured information from a given resume. Use your expertise to carefully organize the extracted information into clean, usable fields.
+
+Resume:
+{resume_text}
+
+Task: Extract the following fields and organize them into structured JSON format:
+- education: (list) A list of educational qualifications mentioned in the resume, including degrees, certifications, or any relevant academic credentials.
+- experience: (list) A list of work experiences, including job titles, companies, and duration (e.g., "Software Developer at TechCorp for 2 years").
+- skills: (list) A list of skills mentioned, including programming languages, tools, frameworks, or soft skills.
+- projects: (list) A list of any projects mentioned, particularly if they showcase relevant work or technical expertise. Optional.
+- certifications: (list) A list of certifications or additional qualifications. Optional.
+- summary: (string) A short 3-4 line summary of the candidate's professional background or profile. Optional.
+
+Instructions:
+1. Output strictly in valid JSON format.
+2. Do not add any extra text, explanations, or Markdown formatting such as ```json.
+3. The JSON response must start directly with `{{` and end with `}}`.
+
+JSON Format:
+
+{{
+  "education": ["Degree 1", "Degree 2"],
+  "experience": ["Experience 1", "Experience 2"],
+  "skills": ["Skill 1", "Skill 2", "Skill 3"],
+  "projects": ["Project 1", "Project 2"],
+  "certifications": ["Certification 1", "Certification 2"],
+  "summary": "A short summary of the candidate's background."
+}}
+""")
+
+
+jd_parsing_prompt = ChatPromptTemplate.from_template("""
+You are an expert data extractor. Your task is to extract structured information from a given job description. Use your understanding to carefully organize the extracted information into clean, usable fields.
+
+Job Description:
+{jd_text}
+
+Task: Extract the following fields and organize them into structured JSON format:
+- title: (string) The job title.
+- company: (string) The company's name.
+- required_skills: (list of important skills mentioned in the job description, minimum 5 if available skills should be important keywords like programming language, framework or tool and sorted by highest importance first).
+- responsibilities: (list of major job duties or responsibilities mentioned).
+- qualifications: (list of qualifications or eligibility requirements).
+- description: (a short 3-4 line summary of the job).
+
+Instructions:
+1. Output strictly in valid JSON format.
+2. Do not add any extra text, explanations, or Markdown formatting such as ```json.
+3. The JSON response must start directly with `{{` and end with `}}`.
+
+JSON Format:
+
+{{
+  "title": "Job title",
+  "company": "Company name",
+  "required_skills": ["Skill 1", "Skill 2", "Skill 3", "Skill 4", "Skill 5"],
+  "responsibilities": ["Responsibility 1", "Responsibility 2", "Responsibility 3"],
+  "qualifications": ["Qualification 1", "Qualification 2"],
+  "description": "A short summary of the job."
+}}
+""")
+
+
+lvl1_prompt_template = ChatPromptTemplate.from_template("""
+You are an expert technical evaluator in {skill}. Your task is to assess a candidate’s {skill} knowledge at the beginner level.
+
+Generate {num} multiple choice questions (MCQs) that comprehensively evaluate their understanding of {skill}.
+
+Strictly follow the JSON format provided below for each question. Do not include any explanations, extra text, or surrounding Markdown such as json```. Your response must start with `[` and end with `]` representing a array and be valid JSON.
+
+JSON format for MCQ:
+  "question": "Your question text here",
+  "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
+  "answer": "The correct option",
+  "max_time_required": "Time in seconds"
+""")
+
+
+lvl2_prompt_template = ChatPromptTemplate.from_template("""
+Description: You are an expert technical evaluator in {skill}. Your job is to evaluate the candiadte's {skill} knowledge at the intermidiate level through the multiple select question.
+
+Task: Generate {num} multiple select question, where multiple options may correct or only one option is correct.
+
+Instructions: Strictly follow the JSON format provided below for each question. Do not include any explanations, extra text, or surrounding Markdown such as json```. Your response must start with `[` and end with `]` representing an array and must be valid JSON.
+
+JSON format for MSQ:
+  "question": "Your question text here",
+  "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
+  "answers": ["Correct Option 1", "Correct Option 2"],  // List of correct answers
+  "max_time_required": "Time in seconds"
+""")
+
+
+lvl3_prompt_template = ChatPromptTemplate.from_template("""
+You are an expert evaluator. Your task is to test whether a candidate is capable of performing a given job role based on its description. Use the job title, company, responsibilities, and qualifications to craft realistic, scenario-based questions.
+
+Job Description:
+Title: {title}
+Company: {company}
+Responsibilities: {responsibilities}
+Qualifications: {qualifications}
+
+Task: Generate {num} scenario-based questions. Each question must be derived directly from the job responsibilities and required qualifications. These scenarios should reflect real-world situations the candidate might face in this job and should test their practical thinking, problem-solving, and decision-making abilities.
+
+Instructions:
+1. For each question, randomly decide whether it should be a multiple choice question (MCQ) or a multiple select question (MSQ).
+2. Strictly follow the corresponding JSON format based on the type you choose.
+3. Do not mention whether it is MCQ or MSQ in the output.
+4. Do not include any explanations, extra text, or surrounding Markdown such as ```json. Your response must start with `[` and end with `]`, representing a valid JSON array.
+5. Base each scenario on actual job responsibilities or qualifications.
+
+
+JSON Formats:
+
+For MCQ (Only one option is correct):
+  "Scenario" : "A real-world situation related to the job description where the candidate must apply relevant knowledge and skills.",
+  "question": "A question testing the candidate's ability to act or decide in that scenario.",
+  "options": ["Option 1", "Option 2", "Option 3", "Option 4", "Option 5"],
+  "answer": "The correct option",
+  "max_time_required": "Time in seconds"
+
+For MSQ (Multiple options are correct):
+  "Scenario" : "A real-world situation related to the job description where the candidate must apply relevant knowledge and skills.",
+  "question": "A question testing the candidate's ability to act or decide in that scenario.",
+  "options": ["Option 1", "Option 2", "Option 3", "Option 4", "Option 5"],
+  "answers": ["Correct Option 1", "Correct Option 2"],
+  "max_time_required": "Time in seconds"
+
+""")
+
+================================================================================
+filepath: app\langgraph\graph\level1.py
+from langgraph.graph import StateGraph
+from app.langgraph.models import UserState
+from app.langgraph.nodes.level1 import (
+    lvl1_mcq_generator,
+    assign_level1_workers,
+    llm_lvl1_mcqs,
+    llm_inference_validator,
+    lvl1_mcq_synthesizer,
+)
+from langgraph.constants import START, END
+
+level1_workflow_builer = StateGraph(UserState)
+
+level1_workflow_builer.add_node("lvl1_mcq_generator", lvl1_mcq_generator)
+level1_workflow_builer.add_node("assign_level1_workers", assign_level1_workers)
+level1_workflow_builer.add_node("llm_lvl1_mcqs", llm_lvl1_mcqs)
+level1_workflow_builer.add_node(
+    "llm_inference_validator", llm_inference_validator)
+level1_workflow_builer.add_node(
+    "lvl1_mcq_synthesizer", lvl1_mcq_synthesizer)
+
+
+level1_workflow_builer.add_edge(START, "lvl1_mcq_generator")
+level1_workflow_builer.add_conditional_edges(
+    "lvl1_mcq_generator", assign_level1_workers, ["llm_lvl1_mcqs"])
+
+level1_workflow_builer.add_edge("lvl1_mcq_synthesizer", END)
+
+
+level1_graph = level1_workflow_builer.compile()
+
+================================================================================
+filepath: app\langgraph\graph\level2.py
+from langgraph.graph import StateGraph
+from app.langgraph.models import UserState
+from app.langgraph.nodes.level2 import (
+    lvl2_mcq_generator,
+    assign_lvl2_skill_workers,
+    llm_lvl2_mcqs,
+    llm_inference_validator,
+    lvl2_mcq_synthesizer,
+)
+from langgraph.constants import START, END
+
+level2_workflow_builder = StateGraph(UserState)
+
+# Add Level 2 nodes to the workflow
+level2_workflow_builder.add_node("lvl2_mcq_generator", lvl2_mcq_generator)
+level2_workflow_builder.add_node(
+    "assign_lvl2_skill_workers", assign_lvl2_skill_workers)
+level2_workflow_builder.add_node("llm_lvl2_mcqs", llm_lvl2_mcqs)
+level2_workflow_builder.add_node(
+    "llm_inference_validator", llm_inference_validator)
+level2_workflow_builder.add_node("lvl2_mcq_synthesizer", lvl2_mcq_synthesizer)
+# Add edges and transitions between nodes
+level2_workflow_builder.add_edge(START, "lvl2_mcq_generator")
+level2_workflow_builder.add_conditional_edges(
+    "lvl2_mcq_generator", assign_lvl2_skill_workers, ["llm_lvl2_mcqs"]
+)
+
+# level2_workflow_builder.add_conditional_edges(
+#     "llm_lvl2_mcqs", llm_inference_validator, ["lvl2_mcq_synthesizer"]
+# )
+
+# level2_workflow_builder.add_edge("lvl2_mcq_synthesizer", "lvl2_await_response")
+# level2_workflow_builder.add_edge("lvl2_await_response", "lvl2_evaluation")
+level2_workflow_builder.add_edge("lvl2_mcq_synthesizer", END)
+
+# Compile the graph
+level2_graph = level2_workflow_builder.compile()
+
+================================================================================
+filepath: app\langgraph\graph\level3.py
+from langgraph.graph import StateGraph
+from app.langgraph.models import UserState
+from app.langgraph.nodes.level3 import (
+    lvl3_mcq_generator,
+    assign_lvl3_skill_workers,
+    llm_lvl3_mcqs,
+    llm_inference_validator3,
+    lvl3_mcq_synthesizer,
+)
+from langgraph.constants import START, END
+
+level3_workflow_builder = StateGraph(UserState)
+
+level3_workflow_builder.add_node("lvl3_mcq_generator", lvl3_mcq_generator)
+level3_workflow_builder.add_node(
+    "assign_lvl3_skill_workers", assign_lvl3_skill_workers)
+level3_workflow_builder.add_node("llm_lvl3_mcqs", llm_lvl3_mcqs)
+level3_workflow_builder.add_node(
+    "llm_inference_validator3", llm_inference_validator3)
+level3_workflow_builder.add_node("lvl3_mcq_synthesizer", lvl3_mcq_synthesizer)
+
+level3_workflow_builder.add_edge(START, "lvl3_mcq_generator")
+level3_workflow_builder.add_conditional_edges(
+    "lvl3_mcq_generator", assign_lvl3_skill_workers, ["llm_lvl3_mcqs"]
+)
+level3_workflow_builder.add_conditional_edges(
+    "llm_lvl3_mcqs", llm_inference_validator3, ["lvl3_mcq_synthesizer"]
+)
+level3_workflow_builder.add_edge("lvl3_mcq_synthesizer", END)
+
+level3_graph = level3_workflow_builder.compile()
+
+================================================================================
+filepath: app\langgraph\graph\main.py
+# main.py
+from app.core.config import memory
+from langgraph.graph import StateGraph
+from app.langgraph.models import UserState
+from app.langgraph.nodes.main.initialize_assessment import initialize_assessment
+from app.langgraph.graph.level1 import level1_graph
+from app.langgraph.graph.level2 import level2_graph
+from app.langgraph.nodes.main.evaluation import level1_evaluation
+from langgraph.constants import START, END
+
+# Build the main graph
+main_graph_builder = StateGraph(UserState)
+
+# Add Nodes
+main_graph_builder.add_node("initialize_assessment", initialize_assessment)
+main_graph_builder.add_node("level1_graph", level1_graph)
+main_graph_builder.add_node("level1_evaluation", level1_evaluation)
+main_graph_builder.add_node("level2_graph", level2_graph)
+
+# Add Edges
+main_graph_builder.add_edge(START, "initialize_user_state")
+main_graph_builder.add_edge("initialize_user_state", "level1_graph")
+main_graph_builder.add_edge("level1_graph", "level1_evaluation")
+main_graph_builder.add_edge("level1_evaluation", "level2_graph")
+main_graph_builder.add_edge("level2_graph", END)
+
+# Compile
+main_graph = main_graph_builder.compile(checkpointer=memory)
+
+================================================================================
+filepath: app\langgraph\nodes\level1.py
+from app.langgraph.models import UserState
+from langgraph.types import Send, Command, interrupt
+from typing import TypedDict, Literal
+from app.langgraph.prompts import lvl1_prompt_template
+from app.langgraph.models import Question
+from app.core.config import llm
+import json
+from uuid import uuid4
+from app.langgraph.models import LevelProgress
+
+
+class LLMInferenceState(TypedDict):
+    skill: str
+    llm_response: str
+
+
+def lvl1_mcq_generator(userState: UserState):
+    userState.current_level = 1
+    userState.unlocked_levels.append(1)
+    return userState
+
+
+def assign_level1_workers(userState: UserState):
+    # Assign workers for level 1
+    skills = userState.job_description.required_skills
+    return [Send('llm_lvl1_mcqs', {'skill': s}) for s in skills]
+
+
+def llm_lvl1_mcqs(state: LLMInferenceState) -> LLMInferenceState:
+    skill = state['skill']
+    prompt = lvl1_prompt_template.format(skill=skill, num=5)
+    response = llm.invoke(prompt)
+    return Send('llm_inference_validator', {'skill': skill, 'llm_response': response.content})
+
+
+def llm_inference_validator(state: LLMInferenceState) -> Command[Literal["lvl1_mcq_synthesizer", "llm_lvl1_mcqs"]]:
+    try:
+        lvl1_mcqs = json.loads(state["llm_response"])
+        skill = state["skill"]
+
+        # Validate lvl1_mcqs is a list
+        if not isinstance(lvl1_mcqs, list):
+            raise ValueError("Parsed MCQs should be a list")
+
+        # Transform into List[Question]
+        questions = []
+        for item in lvl1_mcqs:
+            question = Question(
+                id=str(uuid4()),  # Generate unique id
+                text=item.get("question", ""),
+                options=item.get("options", []),
+                level=1,
+                metadata={
+                    "skill": skill,
+                    "max_time_required": item.get("max_time_required", 60)
+                }
+            )
+            questions.append(question)
+
+        return Command(
+            update={
+                "progress": {
+                    1:  LevelProgress(
+                        level=1,
+                        questions=questions,
+                        answers={},
+                        score=None,
+                        completed=False
+                    )
+                }
+            },
+            goto="lvl1_mcq_synthesizer"
+        )
+
+    except Exception as e:
+        print(f"Invalid JSON or format error: {e}")
+        return Command(
+            update={
+                "skill": state["skill"]  # keep the same skill to retry
+            },
+            goto="llm_lvl1_mcqs"
+        )
+
+
+def lvl1_mcq_synthesizer(userState: UserState) -> UserState:
+    # Synthesize the MCQs for level 1
+    return userState
+
+================================================================================
+filepath: app\langgraph\nodes\level2.py
+from app.langgraph.models import Question, UserState, LevelProgress
+from typing import TypedDict, Literal
+from langgraph.types import Send, Command, interrupt
+from app.langgraph.prompts import lvl2_prompt_template
+from app.core.config import llm
+import json
+from uuid import uuid4
+
+
+class LLMInferenceState(TypedDict):
+    skill: str
+    llm_response: str
+    projects: list[str]
+    experience: list[str]
+
+
+class SkillWorkerState(TypedDict):
+    skills: list[str]
+    projects: list[str]
+    experience: list[str]
+
+
+def lvl2_mcq_generator(userState: UserState):
+    userState.current_level = 2
+    userState.unlocked_levels.append(2)
+    return userState
+
+
+def assign_lvl2_skill_workers(userState: UserState):
+    # Assign workers for level 2
+    skills = userState.job_description.required_skills
+    projects = userState.resume.projects or []
+    experience = userState.resume.experience or []
+    return [Send("llm_lvl2_mcqs", {
+        "skill": s,
+        "projects": projects,
+        "experience": experience
+    }) for s in skills]
+
+
+def llm_lvl2_mcqs(state: SkillWorkerState) -> SkillWorkerState:
+    skill = state["skill"]
+    projects = state["projects"]
+    experience = state["experience"]
+    prompt = lvl2_prompt_template.format(
+        skill=skill, projects=projects, experience=experience, num=5)
+
+    response = llm.invoke(prompt)
+    return Send("llm_inference_validator", {
+        "skill": skill,
+        "llm_response": response.content,
+        "projects": projects,
+        "experience": experience
+    })
+
+
+def llm_inference_validator(state: LLMInferenceState) -> Command[Literal["lvl2_mcq_synthesizer", "llm_lvl2_mcqs"]]:
+    try:
+        lvl2_mcqs = json.loads(state["llm_response"])
+        skill = state["skill"]
+        projects = state["projects"]
+        experience = state["experience"]
+
+        # Validate lvl2_mcqs is a list
+        if not isinstance(lvl2_mcqs, list):
+            raise ValueError("Parsed MCQs should be a list")
+
+        # Transform into List[Question]
+        questions = []
+        for item in lvl2_mcqs:
+            question = Question(
+                id=str(uuid4()),  # Generate unique id
+                text=item.get("question", ""),
+                options=item.get("options", []),
+                level=2,
+                metadata={
+                    "skill": skill,
+                    "max_time_required": item.get("max_time_required", 60),
+                    "projects": projects,
+                    "experience": experience
+                }
+            )
+            questions.append(question)
+
+        return Command(
+            goto="lvl2_mcq_synthesizer",
+            update={
+                "progress": {
+                    2: LevelProgress(
+                        level=2,
+                        questions=questions,
+                        answers={},
+                        score=None,
+                        completed=False
+                    )
+                }
+            }
+        )
+    except Exception as e:
+        print(f"Invalid JSON or format error: {e}")
+        return Command(
+            update={
+                "skill": state["skill"]  # keep the same skill to retry
+            },
+            goto="llm_lvl1_mcqs"
+        )
+
+
+def lvl2_mcq_synthesizer(userState: UserState) -> UserState:
+    return userState
+
+================================================================================
+filepath: app\langgraph\nodes\level3.py
+from typing import TypedDict, List
+from app.langgraph.models import UserState, LevelProgress, Question
+from app.langgraph.prompts import lvl3_prompt_template
+from app.core.config import llm
+from uuid import uuid4
+import json
+from langgraph.types import Send, Command, interrupt
+from typing import Literal
+# Define the LLMInferenceState3 typed dict
+
+
+class LLMInferenceState3(TypedDict):
+    skill: str
+    title: str
+    company: str
+    responsibilities: List[str]
+    qualifications: List[str]
+    llm_response: str
+
+# Define the SkillWorkerInput3 typed dict
+
+
+class SkillWorkerInput3(TypedDict):
+    skills: List[str]
+    title: str
+    company: str
+    responsibilities: List[str]
+    qualifications: List[str]
+
+# lvl3_mcq_generator function
+
+
+def lvl3_mcq_generator(state: UserState):
+    skills = state.job_description.required_skills
+    jd = state.job_description
+    return {
+        "skills": skills,
+        "title": jd.title,
+        "company": jd.company,
+        "responsibilities": jd.responsibilities,
+        "qualifications": jd.qualifications,
+    }
+
+# llm_lvl3_mcqs function
+
+
+def llm_lvl3_mcqs(state: LLMInferenceState3) -> Send:
+    skill = state["skill"]
+    title = state["title"]
+    company = state["company"]
+    responsibilities = state["responsibilities"]
+    qualifications = state["qualifications"]
+    prompt = lvl3_prompt_template.format(
+        skill=skill,
+        title=title,
+        company=company,
+        responsibilities="\n".join(responsibilities),
+        qualifications="\n".join(qualifications),
+        num=10
+    )
+    response = llm.invoke(prompt)
+    # print(f"LLM Response: {response.content}")
+
+    return Send(
+        "llm_inference_validator3",
+        {
+            "llm_response": response.content,
+            "skill": skill,
+            "title": title,
+            "company": company,
+            "responsibilities": responsibilities,
+            "qualifications": qualifications
+        }
+    )
+
+# assign_lvl3_skill_workers function
+
+
+def assign_lvl3_skill_workers(state: SkillWorkerInput3):
+    return [
+        Send("llm_lvl3_mcqs", {
+            "skill": s,
+            "title": state["title"],
+            "company": state["company"],
+            "responsibilities": state["responsibilities"],
+            "qualifications": state["qualifications"]
+        }) for s in state["skills"]
+    ]
+
+# lvl3_await_response function
+
+
+def lvl3_await_response(state: UserState):
+    user_response = interrupt("Waiting for the lvl3 msq response")
+    return {"lvl3_response": user_response}
+
+# lvl3_mcq_synthesizer function
+
+
+def lvl3_mcq_synthesizer(state: dict):
+    return {
+        "lvl3_generated_mcqs": state["lvl3_generated_mcqs"],
+        "current_stage": "lvl_3_waiting_response"
+    }
+
+# llm_inference_validator3 function
+
+
+def llm_inference_validator3(state: LLMInferenceState3) -> Command[Literal["lvl3_mcq_synthesizer", "llm_lvl3_mcqs"]]:
+    try:
+        print(f"State {state}")
+        llm_response = state["llm_response"]
+        print(f"LLM Response: {llm_response}")
+        lvl3_mcqs = json.loads(llm_response)
+        skill = state["skill"]
+        title = state["title"]
+        company = state["company"]
+        responsibilities = state["responsibilities"]
+        qualifications = state["qualifications"]
+
+        # Validate lvl3_mcqs is a list
+        if not isinstance(lvl3_mcqs, list):
+            raise ValueError("Parsed MCQs should be a list")
+
+        # Transform into List[Question]
+        questions = []
+        for item in lvl3_mcqs:
+            question = Question(
+                id=str(uuid4()),  # Generate unique id
+                text=item.get("question", ""),
+                options=item.get("options", []),
+                level=3,
+                metadata={
+                    "skill": skill,
+                    "title": title,
+                    "company": company,
+                    "responsibilities": responsibilities,
+                    "qualifications": qualifications,
+                    "max_time_required": item.get("max_time_required", 60)
+                }
+            )
+            questions.append(question)
+
+        return Command(
+            goto="lvl3_mcq_synthesizer",
+            update={
+                "progress": {
+                    3: LevelProgress(
+                        level=3,
+                        questions=questions,
+                        answers={},
+                        score=None,
+                        completed=False
+                    )
+                }
+            }
+        )
+
+    except Exception as e:
+        print(f"Invalid JSON or format error: {e}")
+        skill = state["skill"]
+        title = state["title"]
+        company = state["company"]
+        responsibilities = state["responsibilities"]
+        qualifications = state["qualifications"]
+        return Command(
+            update={
+                "skill": skill,
+                "title": title,
+                "company": company,
+                "responsibilities": responsibilities,
+                "qualifications": qualifications
+            },
+            goto="llm_lvl3_mcqs"
+        )
+
+================================================================================
+filepath: app\langgraph\nodes\main\evaluation.py
+from langgraph.types import interrupt
+from app.langgraph.models import UserState
+
+
+def level1_evaluation(user_state: UserState) -> UserState:
+    user_answers = interrupt("Please submit your answers for Level 1 MCQs.")
+    level1_progress = user_state.progress.get(1)
+
+    if not level1_progress:
+        raise ValueError("Level 1 progress not found.")
+
+    correct_count = 0
+    total_questions = len(level1_progress.questions)
+
+    for q in level1_progress.questions:
+        # Assuming first option is correct (you can change logic)
+        correct_answer = q.options[0]
+        user_answer = user_answers.get(q.id)
+        if user_answer == correct_answer:
+            correct_count += 1
+
+    score = (correct_count / total_questions) * 100
+
+    # Update the user state
+    level1_progress.answers = user_answers
+    level1_progress.score = score
+    level1_progress.completed = True
+    user_state.progress[1] = level1_progress
+
+    return user_state
+
+================================================================================
+filepath: app\langgraph\nodes\main\initialize_assessment.py
+from app.db.database import get_db
+from fastapi import Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.db.models import CandidateAssessment, Test
+from sqlalchemy import select
+from app.langgraph.models import UserState
+from typing import Dict
+import logging
+from app.langgraph.models import userstate_initializer
+logger = logging.getLogger(__name__)
+
+
+async def initialize_assessment(
+    context: Dict[str, any],
+    userState: UserState = Depends(userstate_initializer)
+) -> UserState:
+
+    parsed_jd = context.get("parsed_jd")
+    parsed_resume = context.get("parsed_resume")
+    if not parsed_jd or not parsed_resume:
+        logger.error(
+            f"Initialization failed: parsed_jd={parsed_jd}, parsed_resume={parsed_resume}")
+        raise HTTPException(status_code=400, detail="JD not found in context")
+
+    userState.job_description = parsed_jd
+    userState.resume = parsed_resume
+
+    logger.info(f"User {userState.user_id} initialized with JD and Resume.")
+    return userState
+
+================================================================================
+filepath: app\langgraph\other\parse_jd.py
+from app.langgraph.prompts import jd_parsing_prompt
+from app.core.config import llm
+import json
+
+
+def parse_jd(jd_text: str) -> dict:
+    """
+    Parse the job description text using OpenAI's GPT-4o model.
+    """
+    # Prepare the prompt
+    prompt = jd_parsing_prompt.format(jd_text=jd_text)
+
+    # Call the OpenAI API
+    response = llm.invoke(prompt)
+
+    # Extract the parsed data from the response
+    response_text = response.content
+
+    # we have to return the string version of the json object
+    # Parse the JSON response
+    try:
+        parsed_data = json.loads(response_text)
+    except json.JSONDecodeError as e:
+        print(f"Error decoding JSON: {e}")
+        return None
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return None
+    # Return the parsed data
+    return json.dumps(parsed_data)
+
+================================================================================
+filepath: app\langgraph\other\parse_resume.py
+from app.langgraph.prompts import resume_parsing_prompt
+from app.core.config import llm
+import json
+
+
+def parse_resume(resume_text: str) -> dict:
+    """
+    Parse the job description text using OpenAI's GPT-4o model.
+    """
+    # Prepare the prompt
+    prompt = resume_parsing_prompt.format(resume_text=resume_text)
+
+    # Call the OpenAI API
+    response = llm.invoke(prompt)
+
+    # Extract the parsed data from the response
+    response_text = response.content
+
+    # we have to return the string version of the json object
+    # Parse the JSON response
+    try:
+        parsed_data = json.loads(response_text)
+    except json.JSONDecodeError as e:
+        print(f"Error decoding JSON: {e}")
+        return None
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return None
+    # Return the parsed data
+    return json.dumps(parsed_data)
+
+================================================================================
+filepath: app\worker\queue.py
+import redis
+import json
+import os
+
+
+redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+redis_con = redis.from_url(redis_url)
+
+QUEUE_NAME = "resume_parsing_queue"
+
+
+def enqueue_resume_task(candidate_uid: str, resume_link: bytes):
+    """
+    Enqueue a resume parsing task to the Redis queue.
+    """
+    task = {
+        "candidate_uid": candidate_uid,
+        "resume_link": resume_link
+    }
+    redis_con.rpush(QUEUE_NAME, json.dumps(task))
+    print(
+        f"Enqueued task for candidate {candidate_uid} with resume link {resume_link}")
+
+================================================================================
+filepath: app\worker\resume_worker.py
+import aiohttp
+import base64
+import fitz  # PyMuPDF
+from app.db.database import get_db
+from app.db.models import Candidate
+from sqlalchemy import select
+import openai
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.config import OPENAI_API_KEY  #
+from langchain.prompts import ChatPromptTemplate
+
+
+def get_gdrive_download_url(view_url: str) -> str:
+    """
+    Convert a Google Drive view URL to a direct download URL.
+    """
+    import re
+    match = re.search(r"/d/([\w-]+)", view_url)
+    if not match:
+        raise ValueError("Invalid Google Drive link format")
+    file_id = match.group(1)
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+
+async def download_resume_pdf(resume_link: str) -> bytes:
+    print(f"Downloading resume from {resume_link}")
+    async with aiohttp.ClientSession() as session:
+        async with session.get(resume_link) as response:
+            if response.status != 200:
+                raise Exception("Failed to download resume")
+            return await response.read()
+
+
+async def convert_pdf_to_base64(pdf_bytes: bytes) -> str:
+    print("Converting PDF to base64 image")
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc.load_page(0)  # first page
+    pix = page.get_pixmap()
+    img_bytes = pix.tobytes("png")
+    base64_img = base64.b64encode(img_bytes).decode('utf-8')
+    return base64_img
+
+
+async def parse_resume_with_openai(base64_img: str) -> str:
+    print("Parsing resume with OpenAI")
+    openai.api_key = OPENAI_API_KEY
+    messages = [
+        {
+            "role": "system",
+            "content": "Extract text from this resume image."
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{base64_img}"
+                    }
+                }
+            ]
+        }
+    ]
+    response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+    )
+    return response.choices[0].message.content
+
+
+async def process_resume(candidate_uid: str, resume_link: str):
+    # 1. Download the resume PDF
+    pdf_bytes = await download_resume_pdf(get_gdrive_download_url(resume_link))
+
+    # 2. Convert PDF to base64 image
+    base64_img = await convert_pdf_to_base64(pdf_bytes)
+
+    # 3. Parse with OpenAI
+    parsed_text = await parse_resume_with_openai(base64_img)
+    # 4. Update Candidate entry
+
+    async for session in get_db():
+        query = await session.execute(select(Candidate).where(Candidate.id == candidate_uid))
+        candidate = query.scalars().first()
+
+        if candidate:
+            candidate.resume_text = parsed_text
+            await session.commit()
+
+================================================================================

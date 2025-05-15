@@ -1,6 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from app.db.database import SessionLocal
+from typing import Optional
+from fastapi import status, APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from app.db.database import AsyncSessionLocal
 from app.db.models import User, Candidate, Recruiter
 from app.core.security import hash_password, verify_password, create_access_token
 from pydantic import BaseModel
@@ -8,12 +10,23 @@ import uuid
 
 router = APIRouter()
 
+# Dependency for async DB session
+
+
+def get_async_db():
+    async def _get_db():
+        async with AsyncSessionLocal() as session:
+            yield session
+    return _get_db
+
+
 class CandidateRegister(BaseModel):
-    name: str
     email: str
     password: str
+    resume_text: Optional[str] = None
+    name: str
     phone: str
-    resume_link: str 
+
 
 class RecruiterRegister(BaseModel):
     name: str
@@ -22,102 +35,144 @@ class RecruiterRegister(BaseModel):
     company: str
     phone: str
 
+
 class UserLogin(BaseModel):
     email: str
     password: str
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 @router.post('/candidate/signup')
-def candidate_signup(user: CandidateRegister, db: Session = Depends(get_db)):
-    if db.query(User).filter_by(email=user.email).first():
+async def candidate_signup(
+        user: CandidateRegister,
+        session: AsyncSession = Depends(get_async_db())
+):
+    result = await session.execute(select(User).filter_by(email=user.email))
+
+    if result.scalars().first():
         raise HTTPException(status_code=400, detail="Email already registered")
+
     uid = str(uuid.uuid4())
-    user_obj = User(uid=uid, email=user.email, password_hash=hash_password(user.password), role='candidate')
-    candidate = Candidate(uid=uid, name=user.name, phone=user.phone,resume_link=user.resume_link)
-    db.add(user_obj)
-    db.add(candidate)
-    db.commit()
+
+    user_obj = User(uid=uid, email=user.email, password_hash=hash_password(
+        user.password), role='candidate', name=user.name)
+
+    candidate = Candidate(uid=uid, resume_text=user.resume_text)
+
+    session.add(user_obj)
+
+    session.add(candidate)
+
+    await session.commit()
     return {"msg": "Candidate created successfully", "uid": uid}
 
+
 @router.post('/recruiter/signup')
-def recruiter_signup(user: RecruiterRegister, db: Session = Depends(get_db)):
-    if db.query(User).filter_by(email=user.email).first():
+async def recruiter_signup(user: RecruiterRegister, session: AsyncSession = Depends(get_async_db())):
+    result = await session.execute(select(User).filter_by(email=user.email))
+    if result.scalars().first():
         raise HTTPException(status_code=400, detail="Email already registered")
     uid = str(uuid.uuid4())
-    user_obj = User(uid=uid, email=user.email, password_hash=hash_password(user.password), role='recruiter')
-    recruiter = Recruiter(uid=uid, name=user.name, company=user.company, phone=user.phone)
-    db.add(user_obj)
-    db.add(recruiter)
-    db.commit()
+    user_obj = User(uid=uid, email=user.email, password_hash=hash_password(
+        user.password), role='recruiter', name=user.name)
+    recruiter = Recruiter(uid=uid,
+                          company=user.company, phone=user.phone)
+    session.add(user_obj)
+    session.add(recruiter)
+    await session.commit()
     return {"msg": "Recruiter created successfully", "uid": uid}
 
+
 @router.post('/login')
-def login(user: UserLogin, db: Session = Depends(get_db)):
-    user_row = db.query(User).filter_by(email=user.email).first()
+async def login(user: UserLogin, session: AsyncSession = Depends(get_async_db())):
+    result = await session.execute(select(User).filter_by(email=user.email))
+    user_row = result.scalars().first()
     if not user_row or not verify_password(user.password, user_row.password_hash):
         raise HTTPException(status_code=400, detail="Invalid credentials")
-    token = create_access_token(data={"sub": user_row.uid, "role": user_row.role})
+    token = create_access_token(
+        data={"sub": user_row.uid, "role": user_row.role})
+    name = user_row.name
+    company = None
+    resume_text = None
+    if user_row.role == 'recruiter':
+        rec_result = await session.execute(select(Recruiter).filter_by(uid=user_row.uid))
+        recruiter = rec_result.scalars().first()
+        company = recruiter.company if recruiter else None
+    elif user_row.role == 'candidate':
+        can_result = await session.execute(select(Candidate).filter_by(uid=user_row.uid))
+        candidate = can_result.scalars().first()
+        if candidate:
+            print(f"Resume text: {candidate.resume_text}")
+        else:
+            print("Candidate not found")
+        resume_text = candidate.resume_text if candidate else None
     return {
-        "token": token, 
-        "token_type": "bearer", 
+        "token": token,
+        "token_type": "bearer",
         "user": {
-            "uid": user_row.uid, 
-            "role": user_row.role, 
+            "uid": user_row.uid,
+            "role": user_row.role,
             "email": user_row.email,
-            "name": user_row.candidate.name if user_row.role == 'candidate' else user_row.recruiter.name,
-            "company": user_row.recruiter.company if user_row.role == 'recruiter' else None,
+            "name": name,
+            "company": company,
+            "resume_text": resume_text
         }
     }
 
 # CRUD endpoints for candidate and recruiter profiles
-from fastapi import status
-from typing import Optional
+
 
 class CandidateProfileUpdate(BaseModel):
-    name: Optional[str]
-    phone: Optional[str]
+    resume_text: Optional[str] = None
+
 
 class RecruiterProfileUpdate(BaseModel):
     name: Optional[str]
     company: Optional[str]
     phone: Optional[str]
 
+
 @router.get('/candidate/profile')
-def get_candidate_profile(uid: str, db: Session = Depends(get_db)):
-    candidate = db.query(Candidate).filter_by(uid=uid).first()
+async def get_candidate_profile(uid: str, session: AsyncSession = Depends(get_async_db())):
+    result = await session.execute(select(Candidate).filter_by(uid=uid))
+    candidate = result.scalars().first()
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
-    return {"uid": candidate.uid, "name": candidate.name, "phone": candidate.phone}
+
+    user_result = await session.execute(select(User).filter_by(uid=uid))
+    user = user_result.scalars().first()
+
+    return {
+        "uid": candidate.uid,
+        "email": user.email if user else None,
+        "resume_text": candidate.resume_text
+    }
+
 
 @router.put('/candidate/profile')
-def update_candidate_profile(uid: str, update: CandidateProfileUpdate, db: Session = Depends(get_db)):
-    candidate = db.query(Candidate).filter_by(uid=uid).first()
+async def update_candidate_profile(uid: str, update: CandidateProfileUpdate, session: AsyncSession = Depends(get_async_db())):
+    result = await session.execute(select(Candidate).filter_by(uid=uid))
+    candidate = result.scalars().first()
     if not candidate:
         raise HTTPException(status_code=404, detail="Candidate not found")
-    if update.name:
-        candidate.name = update.name
-    if update.phone:
-        candidate.phone = update.phone
-    db.commit()
+    if update.resume_text is not None:
+        candidate.resume_text = update.resume_text
+    await session.commit()
     return {"msg": "Candidate profile updated"}
 
 
 @router.get('/recruiter/profile')
-def get_recruiter_profile(uid: str, db: Session = Depends(get_db)):
-    recruiter = db.query(Recruiter).filter_by(uid=uid).first()
+async def get_recruiter_profile(uid: str, session: AsyncSession = Depends(get_async_db())):
+    result = await session.execute(select(Recruiter).filter_by(uid=uid))
+    recruiter = result.scalars().first()
     if not recruiter:
         raise HTTPException(status_code=404, detail="Recruiter not found")
     return {"uid": recruiter.uid, "name": recruiter.name, "company": recruiter.company, "phone": recruiter.phone}
 
+
 @router.put('/recruiter/profile')
-def update_recruiter_profile(uid: str, update: RecruiterProfileUpdate, db: Session = Depends(get_db)):
-    recruiter = db.query(Recruiter).filter_by(uid=uid).first()
+async def update_recruiter_profile(uid: str, update: RecruiterProfileUpdate, session: AsyncSession = Depends(get_async_db())):
+    result = await session.execute(select(Recruiter).filter_by(uid=uid))
+    recruiter = result.scalars().first()
     if not recruiter:
         raise HTTPException(status_code=404, detail="Recruiter not found")
     if update.name:
@@ -126,19 +181,19 @@ def update_recruiter_profile(uid: str, update: RecruiterProfileUpdate, db: Sessi
         recruiter.company = update.company
     if update.phone:
         recruiter.phone = update.phone
-    db.commit()
+    await session.commit()
     return {"msg": "Recruiter profile updated"}
 
+
 @router.delete('/recruiter/profile')
-def delete_recruiter_profile(uid: str, db: Session = Depends(get_db)):
-    recruiter = db.query(Recruiter).filter_by(uid=uid).first()
-    user = db.query(User).filter_by(uid=uid).first()
+async def delete_recruiter_profile(uid: str, session: AsyncSession = Depends(get_async_db())):
+    rec_result = await session.execute(select(Recruiter).filter_by(uid=uid))
+    recruiter = rec_result.scalars().first()
+    user_result = await session.execute(select(User).filter_by(uid=uid))
+    user = user_result.scalars().first()
     if not recruiter or not user:
         raise HTTPException(status_code=404, detail="Recruiter not found")
-    db.delete(recruiter)
-    db.delete(user)
-    db.commit()
+    await session.delete(recruiter)
+    await session.delete(user)
+    await session.commit()
     return {"msg": "Recruiter deleted"}
-
-
-
