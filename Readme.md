@@ -1,168 +1,158 @@
-# Getting Started
+# AI-Powered Technical Assessment Platform
 
-## 1. Install Dependencies
+This platform uses LangGraph and LLM technology to create adaptive technical assessments for candidates based on job descriptions and resumes.
 
-```
-pip install -r requirements.txt
-```
+## Quick Setup
 
-## 2. Configure Environment Variables
+1. **Install Dependencies**
 
-Create a `.env` file in the project root with the following content (replace with your actual keys):
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-```
-OPENAI_API_KEY=your-openai-key
-SENDGRID_API_KEY=your-sendgrid-key
-SENDGRID_SENDER_EMAIL=your-email@example.com
-```
+2. **Configure Environment Variables**
+   Create a `.env` file in the project root:
 
-## 3. Run the Application
+   ```
+   OPENAI_API_KEY=your-openai-key
+   SENDGRID_API_KEY=your-sendgrid-key  # Optional for email notifications
+   SENDGRID_SENDER_EMAIL=your-email@example.com  # Optional
+   ```
 
-```
-uvicorn app.main:app --reload
-```
+3. **Run the Application**
+   ```bash
+   uvicorn app.main:app --reload
+   ```
+   The API will be available at `http://localhost:8000`
 
-The API will be available at `http://localhost:8000`.
+## LangGraph Architecture
 
-# API Endpoints
+The core of this platform is a multi-level assessment workflow implemented with LangGraph, designed to provide adaptive technical assessments based on job requirements and candidate qualifications.
 
-## Authentication
+### Technical Architecture Diagrams
 
-### POST `/auth/login`
+#### Level 1 Assessment Flow
 
-Authenticate a user and receive a JWT token.
+![Level 1 Assessment Flow](docs/level1_flow.png)
+_Diagram shows the question generation process with level1_mcq_generator, worker assignment, LLM calls, response validation, and question synthesis_
 
-- **Input:**
-  - `email`: string
-  - `password`: string
-- **Response:**
-  - `access_token`: string
-  - `token_type`: string
+#### Resume Processing Workflow
 
----
+![Resume Processing Workflow](docs/resume_processing.png)
+_Diagram shows the pipeline from recruiter upload through candidate database updates, PDF processing, and text extraction_
 
-## Recruiter Test Management
+#### Main Assessment Graph
 
-### POST `/test/recruiter/test`
+![Main Assessment Graph](docs/main_graph.png)
+_Diagram illustrates the context initialization, assessment initialization, level progression, and evaluation cycles_
 
-Create a new test (job description) as a recruiter.
+### LangGraph Component Structure
 
-- **Input:**
-  - `title`: string
-  - `jd_text`: string
-  - `scheduled_start`: datetime (optional)
-  - `scheduled_end`: datetime (optional)
-- **Response:**
-  - `msg`: string
-  - `test_id`: string
+The LangGraph implementation is structured in layers:
 
-### GET `/test/recruiter/tests`
+1. **Models** (`app/langgraph/models.py`):
 
-List all tests created by the recruiter.
+   - `UserState`: Core state object containing all assessment data
+   - `JobDescription`: Job requirements and details
+   - `Resume`: Candidate qualifications and experience
+   - `Question` & `LevelProgress`: Assessment tracking
 
-- **Response:**
-  - List of test objects (see model)
+2. **Graph Definitions** (`app/langgraph/graph/`):
 
-### PUT `/test/recruiter/test/{test_id}`
+   - `main.py`: Orchestrates overall assessment flow
+   - `level1.py`, `level2.py`, `level3.py`: Individual assessment level graphs
 
-Update a test's details.
+3. **Node Implementations** (`app/langgraph/nodes/`):
+   - Each node handles specific operations like:
+     - Question generation
+     - Answer evaluation
+     - Level progression logic
 
-- **Input:**
-  - Any of: `title`, `jd_text`, `scheduled_start`, `scheduled_end`
-- **Response:**
-  - `msg`: string
+## State Management with LangGraph Checkpointing
 
-### DELETE `/test/recruiter/test/{test_id}`
+A crucial aspect of this application is how it bridges the gap between **LangGraph's stateful nature** and our **stateless REST API architecture**.
 
-Delete a test.
+### Checkpointing System
 
-- **Response:**
-  - `msg`: string
+![State Management Architecture](docs/main_graph.png)
+_The assessment workflow maintains state across API requests through LangGraph's checkpointing system_
 
-### POST `/test/recruiter/test/{test_id}/add_candidates`
+LangGraph is inherently stateful, maintaining conversational context and assessment progress through a graph-based execution flow. However, our platform exposes this functionality through a traditional stateless REST API. To solve this architectural challenge, we use LangGraph's built-in checkpointing system:
 
-Add candidates to a test.
+1. **Persistent State Storage**
 
-- **Input:**
-  - List of candidates:
-    - `name`: string
-    - `email`: string
-    - `phone`: string
-    - `resume_link`: string (Google Drive PDF link)
-- **Response:**
-  - List of candidate creation results
+   - All assessment states are stored in `checkpoints.sqlite3` database files
+   - Each user session has a unique trace ID that maps to its full state
+   - This allows the REST API to be stateless while the underlying assessment remains stateful
 
----
+2. **State Recovery Between Requests**
 
-## Candidate Assessment
+   ```python
+   # Initialize graph with persistent storage
+   graph = StateGraph(UserState)
+   # Configure checkpointer with SQLite storage
+   checkpointer = SqliteSaver(f"checkpoints.sqlite3")
+   # Create a stateful application with persistence
+   app = graph.compile(checkpointer=checkpointer)
+   ```
 
-### GET `/test/candidate/tests`
+3. **Request/Response Flow**
+   - API request contains a session identifier
+   - The system retrieves the relevant checkpoint based on this identifier
+   - LangGraph resumes execution from the saved state
+   - Assessment progression is saved back to the checkpoint after processing
+   - The stateless API returns only the relevant response data
 
-List all available tests for the logged-in candidate.
+This architecture provides several advantages:
 
-- **Response:**
-  - List of test objects
+- **Horizontal Scalability**: Multiple API servers can access the same checkpoints
+- **Fault Tolerance**: Assessment progress is not lost if a server instance fails
+- **Session Continuity**: Candidates can pause and resume assessments at any point
+- **Efficient Resource Usage**: Server memory isn't consumed by inactive sessions
 
-### POST `/test/candidate/assessment/start`
+## Key Workflow Details
 
-Start an assessment for a candidate.
+### Level 1: Technical Skill Matching
 
-- **Input:**
-  - `candidate_uid`: string
-  - `test_id`: string
-- **Response:**
-  - `assessment_id`: string
-  - `current_level`: int
-  - `resume_text`: string (parsed resume)
-  - `jd_fields`: dict (parsed JD fields)
+- Skill gap analysis between job description and resume
+- Multiple-choice question generation targeted at required skills
+- Response evaluation with detailed feedback
+- Level progression decision based on performance
 
-### POST `/test/candidate/assessment/{assessment_id}/level/{level}/submit`
+### Level 2: Advanced Scenario Questions
 
-Submit answers for a specific assessment level.
+- Review of candidate's skill profile from Level 1
+- Generation of scenario-based questions for deeper technical assessment
+- Technical evaluation with code analysis where appropriate
+- Level 3 unlock logic based on demonstrated problem-solving ability
 
-- **Input:**
-  - `state`: dict (current workflow state)
-  - `response`: dict (user's answers for this level)
-- **Response:**
-  - `assessment_id`: string
-  - `level`: int
-  - `result`: dict (next questions, pass/fail, or end)
+### Level 3: System Design Challenges
 
-### GET `/test/candidate/assessment/{assessment_id}/state`
+- Architecture problem generation aligned with job requirements
+- Solution evaluation based on system design principles
+- Final assessment for senior-level positions
 
-Get the current state/progress of an assessment.
+## Demonstration Instructions
 
-- **Response:**
-  - `assessment_id`: string
-  - `state`: dict (current workflow state)
+To run a demonstration of the LangGraph assessment workflow:
 
-### GET `/test/candidate/assessments`
+1. **Update Environment Variables**
+   Ensure your `.env` file contains a valid OpenAI API key
 
-List all assessments for a candidate.
+2. **Run the Standalone Demonstration**
 
-- **Input:**
-  - `candidate_uid`: string
-- **Response:**
-  - List of assessment objects
+   ```bash
+   python test.py
+   ```
 
----
+3. **Review Assessment Results**
+   The demonstration will show the progression through assessment levels based on the inputs.
 
-# Notes
+## Resume Processing Integration
 
-- All endpoints require authentication unless otherwise specified.
-- For assessment, resumes are parsed from Google Drive PDF links using LLM (no OCR dependency).
-- Job Descriptions are parsed using LLM for structured extraction.
-- All workflow state is checkpointed in SQLite for reliability.
+The platform also includes an asynchronous resume processing service that:
 
-# Example: Submitting Level Answers
-
-```json
-POST /test/candidate/assessment/{assessment_id}/level/1/submit
-{
-  "state": { ... },
-  "response": {
-    "skill1": { "q1_id": "answer", ... },
-    ...
-  }
-}
-```
+1. Downloads candidate resumes from Google Drive
+2. Converts PDF content to text using OpenAI's Vision API
+3. Updates the candidate profile with extracted information
+4. Feeds this data into the LangGraph assessment flow
